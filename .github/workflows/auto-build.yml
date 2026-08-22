@@ -1,0 +1,313 @@
+# cloudflared 官方更新 → 自动补丁 → 编译 → 发布
+#
+# 触发方式:
+#   1. schedule     : 每天两次检查 cloudflare/cloudflared 官方最新稳定版 Release
+#   2. push         : fix/ 补丁或本 workflow 变更时自检（首次推送即完成一次完整构建）
+#   3. workflow_dispatch : 手动触发，可指定 version（任意官方 tag，含 beta）与 force（强制重建）
+#
+# 判定逻辑: 官方最新版本号 -> 查本仓库是否已有 "<版本>-dnsfix" Release -> 没有则构建
+# 构建流程: 下载官方源码 zip -> 按 go.mod 安装 Go -> fix/build-android.sh 注入双补丁并编译
+#           -> 补丁适配性检查 -> 单元测试 -> linux/amd64 冒烟测试 -> 发布 Release（二进制+zip+SHA256SUMS）
+#
+# 前提: 仓库 Settings -> Actions -> General -> Workflow permissions
+#       选择 "Read and write permissions"（本文件已声明 permissions: contents: write）
+
+name: cloudflared 官方更新自动补丁编译
+
+on:
+  schedule:
+    - cron: "23 18 * * *" # UTC 18:23 = 北京时间 02:23
+    - cron: "23 6 * * *"  # UTC 06:23 = 北京时间 14:23
+  push:
+    branches: [main, master]
+    paths:
+      - "fix/**"
+      - ".github/workflows/auto-build.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "官方版本号（如 2026.8.2，也可填 beta tag；留空=自动检测最新稳定版）"
+        required: false
+        default: ""
+      force:
+        description: "强制重建（Release 已存在时也重新编译并覆盖产物）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudflared-auto-build
+  cancel-in-progress: false
+
+jobs:
+  # ============================ 1. 检测官方更新 ============================
+  detect:
+    name: 检测官方更新
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: 查询官方最新稳定版并判断是否需要构建
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            ver="$INPUT_VERSION"
+            echo "手动指定构建版本: $ver"
+          else
+            # 官方 Releases 列表（按发布时间倒序），取第一个非 prerelease/draft 且非 beta/rc 的 tag
+            ver="$(gh api 'repos/cloudflare/cloudflared/releases?per_page=30' \
+              --jq '[.[] | select(.prerelease == false and .draft == false)
+                    | .tag_name | select(test("-beta|-rc") | not)] | .[0] // empty')"
+            if [ -z "$ver" ]; then
+              ver="$(gh api repos/cloudflare/cloudflared/releases/latest --jq .tag_name)"
+            fi
+          fi
+          if [ -z "$ver" ]; then
+            echo "::error::未能获取官方最新版本号"
+            exit 1
+          fi
+          echo "官方最新版本: $ver"
+
+          tag="${ver}-dnsfix"
+          build=true
+          reason="检测到未构建的新版本"
+          if [ "${FORCE:-}" = "true" ]; then
+            reason="手动触发强制重建"
+          elif gh api "repos/${REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
+            build=false
+            reason="Release ${tag} 已存在"
+          fi
+
+          {
+            echo "version=$ver"
+            echo "should_build=$build"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$build" = "true" ]; then verdict="需要构建"; else verdict="跳过"; fi
+          {
+            echo "## 官方更新检测"
+            echo ""
+            echo "| 项目 | 结果 |"
+            echo "|---|---|"
+            echo "| 官方最新稳定版 | ${ver} |"
+            echo "| 本仓库对应 Release | ${tag} |"
+            echo "| 结论 | **${verdict}**（${reason}） |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ====================== 2. 注入补丁 → 编译 → 测试 → 发布 ======================
+  build:
+    name: 注入补丁并编译发布
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      UPSTREAM_VERSION: ${{ needs.detect.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 检出本仓库（fix/ 补丁套件）
+        uses: actions/checkout@v4
+
+      - name: 下载官方源码
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o src.zip \
+            "https://github.com/cloudflare/cloudflared/archive/refs/tags/${UPSTREAM_VERSION}.zip"
+          unzip -q src.zip
+          test -f "cloudflared-${UPSTREAM_VERSION}/go.mod"
+          echo "官方源码就绪: cloudflared-${UPSTREAM_VERSION}"
+
+      - name: 安装 Go（版本取自官方 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "cloudflared-${{ env.UPSTREAM_VERSION }}/go.mod"
+          cache-dependency-path: "cloudflared-${{ env.UPSTREAM_VERSION }}/go.sum"
+
+      - name: 注入双补丁并编译（fix/build-android.sh）
+        run: |
+          set -euo pipefail
+          CLOUDFLARED_VERSION="${UPSTREAM_VERSION}" \
+            bash fix/build-android.sh "cloudflared-${UPSTREAM_VERSION}" dist
+          ls -lh dist/
+
+      - name: 补丁适配性检查（指南第 6 节检查点）
+        id: checks
+        run: |
+          set -euo pipefail
+          src="cloudflared-${UPSTREAM_VERSION}"
+          fail=0
+
+          if [ -f "${src}/cmd/cloudflared/android_dns.go" ]; then
+            echo "主补丁已注入: ${src}/cmd/cloudflared/android_dns.go"
+          else
+            echo "::error::主补丁 android_dns.go 未注入"
+            fail=1
+          fi
+
+          second="未应用（官方代码结构变化，按指南 6.5 人工适配；不影响主修复）"
+          if grep -q 'androidFixProbeUDP' "${src}/ingress/origins/dns.go"; then
+            second="已应用（v2：回环:53 判死 + 真实 UDP 探测 + 公共 DNS 回退）"
+            echo "第二补丁 v2 已应用"
+          else
+            echo "::warning::第二补丁 v2 未应用（主修复不受影响）"
+          fi
+          echo "second_patch=${second}" >> "$GITHUB_OUTPUT"
+
+          if [ -f dist/cloudflared-android-arm64 ]; then
+            file dist/cloudflared-android-arm64
+          else
+            echo "::error::主力产物 cloudflared-android-arm64 缺失"
+            fail=1
+          fi
+          [ "$fail" = "0" ] || exit 1
+
+      - name: 单元测试（两个补丁的自测用例）
+        run: |
+          set -euo pipefail
+          cd "cloudflared-${UPSTREAM_VERSION}"
+          go test ./cmd/cloudflared ./ingress/origins \
+            -run 'TestAndroidDNS|TestPeekDial|TestAndroidFix' -v -count=1
+
+      - name: 冒烟测试（版本注入 + DNS 修复生效验证）
+        run: |
+          set -euo pipefail
+          out="$(CLOUDFLARED_DNS_SERVERS=1.1.1.1,8.8.8.8 \
+            ./dist/cloudflared-linux-amd64 --version 2>&1)" || true
+          echo "$out"
+          if ! grep -q 'android-dns-fix' <<<"$out"; then
+            echo "::error::冒烟测试失败：未见 android-dns-fix 生效日志"
+            exit 1
+          fi
+          if ! grep -q "${UPSTREAM_VERSION}-dnsfix" <<<"$out"; then
+            echo "::error::冒烟测试失败：版本号注入失败（main.Version 变量可能被官方改名）"
+            exit 1
+          fi
+
+      - name: 汇总产物并生成发布说明
+        env:
+          SECOND_PATCH: ${{ steps.checks.outputs.second_patch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp dist/cloudflared-* dist/SHA256SUMS.txt release/
+          cp "cloudflared-${UPSTREAM_VERSION}-dnsfix-android.zip" release/
+          ls -lh release/
+
+          cat > release/release-notes.md <<EOF
+          ## cloudflared ${UPSTREAM_VERSION} Android DNS-Fix（自动构建）
+
+          构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，构建机 Go: $(go version | cut -d' ' -f3)。
+          流水线：检测官方更新 → 下载源码 → 注入双补丁 → 编译 → 单元/冒烟测试 → 发布。
+
+          上游源码：[cloudflared ${UPSTREAM_VERSION}](https://github.com/cloudflare/cloudflared/releases/tag/${UPSTREAM_VERSION})
+
+          ### 修复内容
+          1. **主补丁** \`cmd/cloudflared/android_dns.go\`：启动时替换全局 DNS 解析器
+             （环境变量 \`CLOUDFLARED_DNS_SERVERS\` > 安卓系统 DNS > 公共 DNS 并发探测取最快，轮询自愈），
+             修复安卓无 \`/etc/resolv.conf\` 导致的 \`lookup ... on [::1]:53: connection refused\`、
+             边缘发现与隧道注册失败。
+          2. **第二补丁 v2** \`ingress/origins/dns.go\`（${SECOND_PATCH}）：修复域名型源站的
+             \`Failed to initialize DNS local resolver\` 报错。
+
+          ### 产物
+          | 文件 | 说明 |
+          |---|---|
+          | \`cloudflared-android-arm64\` | 安卓 64 位标准 PIE 版（**主力推荐**） |
+          | \`cloudflared-linux-arm64\` | 纯静态兜底（arm64 安卓可直接运行） |
+          | \`cloudflared-linux-arm\` | 纯静态兜底（32 位安卓可用） |
+          | \`cloudflared-linux-amd64\` | 纯静态兜底（x86 模拟器可用） |
+          | \`cloudflared-${UPSTREAM_VERSION}-dnsfix-android.zip\` | 全部产物打包 |
+          | \`SHA256SUMS.txt\` | 校验和 |
+
+          > 注：\`cloudflared-android-arm\` / \`-amd64\` 需要 Android NDK 外部链接，CI 未提供，
+          > 请用对应的 linux 纯静态版替代（安卓可直接运行）。
+
+          ### 安卓部署
+          \`\`\`bash
+          adb push cloudflared-android-arm64 /data/local/tmp/cloudflared
+          adb shell chmod +x /data/local/tmp/cloudflared
+          adb shell /data/local/tmp/cloudflared --version   # 应出现 INF android-dns-fix 日志
+          adb shell /data/local/tmp/cloudflared --no-autoupdate tunnel run --token-file /data/local/tmp/cloudflared/token
+          \`\`\`
+          可选：\`CLOUDFLARED_DNS_SERVERS=223.5.5.5,119.29.29.29\` 手动指定 DNS（跳过探测）。
+
+          ### CI 验证
+          - 单元测试：\`TestAndroidDNS*\` / \`TestPeekDial*\` / \`TestAndroidFix*\` 全部 PASS
+          - 冒烟测试：版本注入（\`${UPSTREAM_VERSION}-dnsfix\`）与 \`android-dns-fix\` 生效日志均确认
+          - SHA256：
+          \`\`\`
+          $(cat dist/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+      - name: 上传构建产物（Artifacts 备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-${{ needs.detect.outputs.version }}-dnsfix
+          path: release/
+          if-no-files-found: error
+
+      - name: 发布 GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="${UPSTREAM_VERSION}-dnsfix"
+          title="cloudflared ${UPSTREAM_VERSION} Android DNS-Fix"
+          files=()
+          for f in release/cloudflared-android-arm64 release/cloudflared-linux-arm64 \
+                   release/cloudflared-linux-arm release/cloudflared-linux-amd64 \
+                   release/SHA256SUMS.txt \
+                   "release/cloudflared-${UPSTREAM_VERSION}-dnsfix-android.zip"; do
+            if [ -f "$f" ]; then files+=("$f"); fi
+          done
+          echo "发布资产: ${files[*]}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，覆盖产物并更新说明"
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --title "$title" --notes-file release/release-notes.md
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file release/release-notes.md
+          fi
+
+      - name: 记录已构建版本（保持仓库活跃，防止定时任务 60 天无提交被 GitHub 停用）
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout "$GITHUB_REF_NAME" >/dev/null 2>&1 || true
+          mkdir -p .github
+          printf '%s %s\n' "${UPSTREAM_VERSION}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > .github/last-built.txt
+          git add .github/last-built.txt
+          if git diff --cached --quiet; then
+            echo "last-built.txt 无变化，跳过提交"
+          else
+            git commit -m "chore: 自动构建 cloudflared ${UPSTREAM_VERSION}-dnsfix [skip ci]"
+            if ! git push origin "$GITHUB_REF_NAME"; then
+              echo "::warning::last-built.txt 推送失败（不影响本次 Release）"
+            fi
+          fi
+
+      - name: 构建摘要
+        env:
+          SECOND_PATCH: ${{ steps.checks.outputs.second_patch }}
+        run: |
+          {
+            echo "## 构建与发布结果"
+            echo ""
+            echo "- 版本: **${UPSTREAM_VERSION}-dnsfix**"
+            echo "- 第二补丁: ${SECOND_PATCH}"
+            echo "- 发布资产数: $(ls release/cloudflared-* release/SHA256SUMS.txt 2>/dev/null | wc -l)"
+            echo "- Release: [${UPSTREAM_VERSION}-dnsfix](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${UPSTREAM_VERSION}-dnsfix)"
+          } >> "$GITHUB_STEP_SUMMARY"

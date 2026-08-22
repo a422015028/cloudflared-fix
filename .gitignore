@@ -1,0 +1,7 @@
+# 本地构建产物与临时文件
+/dist/
+/out*/
+/cloudflared-2*/
+/src.zip
+/cloudflared-*-android.zip
+*.log

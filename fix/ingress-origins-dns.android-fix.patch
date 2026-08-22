@@ -1,0 +1,96 @@
+--- a/b/ingress/origins/dns.go (v2 修复后) (官方原始)	2026-08-14 11:22:52.000000000 +0000
++++ b/ingress/origins/dns.go (v2 修复后)	2026-08-21 14:40:13.337633084 +0000
+@@ -6,6 +6,7 @@
+ 	"math/big"
+ 	"net"
+ 	"net/netip"
++	"runtime"
+ 	"slices"
+ 	"sync"
+ 	"time"
+@@ -197,10 +198,84 @@
+ 	return resolver.LookupNetIP(ctx, "ip", host)
+ }
+ 
++// android-dns-fix v2: on Android there is no /etc/resolv.conf, so the stdlib falls back
++// to [::1]:53 / 127.0.0.1:53 where no DNS listener exists. Note that a UDP "dial" to
++// those addresses always succeeds (UDP has no handshake); the failure only surfaces
++// later at read time ("read: connection refused"), which is why a dial-error-only
++// fallback (v1) never triggered. v2 detects loopback:53 targets and verifies real
++// reachability (skipped on GOOS=android, where the system resolver never listens on
++// loopback:53), then falls back to public resolvers. This fixes
++// "Failed to initialize DNS local resolver" and keeps hostname-origin resolution working.
++var androidFixFallbackDNS = []string{
++	"223.5.5.5:53",
++	"119.29.29.29:53",
++	"1.1.1.1:53",
++	"8.8.8.8:53",
++}
++
++const androidFixProbeTimeout = 500 * time.Millisecond
++
++func androidFixIsLoopback53(address string) bool {
++	host, port, err := net.SplitHostPort(address)
++	if err != nil || port != "53" {
++		return false
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
++
++// androidFixProbeUDP sends a minimal DNS query ("." NS) and waits for any reply to
++// determine whether a working UDP resolver actually exists behind a dialable address.
++func androidFixProbeUDP(addr string, timeout time.Duration) bool {
++	c, err := net.DialTimeout("udp", addr, timeout)
++	if err != nil {
++		return false
++	}
++	defer c.Close()
++	_ = c.SetDeadline(time.Now().Add(timeout))
++	// minimal DNS query: header(RD=1, qdcount=1) + root qname + qtype=NS + qclass=IN
++	q := []byte{0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01}
++	if _, err := c.Write(q); err != nil {
++		return false
++	}
++	buf := make([]byte, 512)
++	_, err = c.Read(buf)
++	return err == nil
++}
++
++func androidFixDialFallback(ctx context.Context, network string) (net.Conn, string, bool) {
++	for _, srv := range androidFixFallbackDNS {
++		var d net.Dialer
++		if c, e := d.DialContext(ctx, network, srv); e == nil {
++			return c, srv, true
++		}
++	}
++	return nil, "", false
++}
++
+ func (r *resolver) peekDial(ctx context.Context, network, address string) (net.Conn, error) {
+ 	r.network = network
+ 	r.address = address
+-	return r.dialFunc(network, address)
++	if androidFixIsLoopback53(address) {
++		dead := runtime.GOOS == "android" || !androidFixProbeUDP(address, androidFixProbeTimeout)
++		if dead {
++			// android-dns-fix: system resolver address unusable, use a public resolver
++			if conn, srv, ok := androidFixDialFallback(ctx, network); ok {
++				r.address = srv
++				return conn, nil
++			}
++		}
++	}
++	conn, err := r.dialFunc(network, address)
++	if err != nil {
++		// android-dns-fix: retry with public resolvers (e.g. TCP dial to dead loopback)
++		if conn, srv, ok := androidFixDialFallback(ctx, network); ok {
++			r.address = srv
++			return conn, nil
++		}
++		return nil, err
++	}
++	return conn, nil
+ }
+ 
+ // NewDNSDialer creates a custom dialer for the DNS resolver service to utilize.
